@@ -161,6 +161,14 @@
   <string name="settings_dialog_tos_title" translatable="false">Terms of service</string>
   <string name="settings_dialog_view_app_terms_of_service" translatable="false">View App Terms of Service</string>
   <string name="settings_dialog_gemma_prohibited_use_policy" translatable="false">Gemma Prohibited Use Policy</string>
+  <string name="share_image_notification_processing_title" translatable="false">Analyzing shared image</string>
+  <string name="share_image_notification_processing_content" translatable="false">Running image analysis with %s</string>
+  <string name="share_image_notification_result_title" translatable="false">Shared image result</string>
+  <string name="share_image_notification_error_title" translatable="false">Shared image analysis failed</string>
+  <string name="share_image_no_model_downloaded" translatable="false">No downloaded Ask Image model is available. Download an image-capable model first.</string>
+  <string name="share_image_decoding_failed" translatable="false">Failed to open the shared image.</string>
+  <string name="share_image_empty_result" translatable="false">The model did not return a description for the shared image.</string>
+  <string name="share_image_prompt" translatable="false">この画像が何かを日本語で短く説明してください。わからない場合は見える内容だけを述べてください。</string>
   <string name="share" translatable="false">Share</string>
   <string name="slide_up_to_cancel" translatable="false">Slide up to cancel</string>
   <string name="system_prompt_updated" translatable="false">System prompt updated</string>

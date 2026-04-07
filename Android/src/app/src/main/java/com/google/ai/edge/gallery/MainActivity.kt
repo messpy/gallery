@@ -17,8 +17,13 @@
 package com.google.ai.edge.gallery
 
 import android.animation.ObjectAnimator
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.ImageDecoder
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.View
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
@@ -47,18 +52,26 @@ import androidx.core.animation.doOnEnd
 import androidx.core.os.bundleOf
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.lifecycleScope
+import com.google.ai.edge.gallery.data.BuiltInTaskId
+import com.google.ai.edge.gallery.data.Model
+import com.google.ai.edge.gallery.data.ModelDownloadStatusType
+import com.google.ai.edge.gallery.runtime.runtimeHelper
+import com.google.ai.edge.gallery.ui.modelmanager.ModelInitializationStatusType
 import com.google.ai.edge.gallery.ui.modelmanager.ModelManagerViewModel
 import com.google.ai.edge.gallery.ui.theme.GalleryTheme
 import com.google.ai.edge.litertlm.ExperimentalApi
 import com.google.ai.edge.litertlm.ExperimentalFlags
 import com.google.firebase.analytics.FirebaseAnalytics
 import dagger.hilt.android.AndroidEntryPoint
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
 
+  private var handledSharedImageKey: String? = null
   private val modelManagerViewModel: ModelManagerViewModel by viewModels()
   private var splashScreenAboutToExit: Boolean = false
   private var contentSet: Boolean = false
@@ -156,6 +169,14 @@ class MainActivity : ComponentActivity() {
     }
     // Keep the screen on while the app is running for better demo experience.
     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+    handleSharedImageIntent(intent)
+  }
+
+  override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    setIntent(intent)
+    handleSharedImageIntent(intent)
   }
 
   override fun onResume() {
@@ -173,5 +194,171 @@ class MainActivity : ComponentActivity() {
 
   companion object {
     private const val TAG = "AGMainActivity"
+    private const val SHARE_IMAGE_NOTIFICATION_ID = 41231
+    private const val SHARE_IMAGE_TIMEOUT_MS = 120_000L
+  }
+
+  private fun handleSharedImageIntent(intent: Intent?) {
+    val sharedImageUri = extractSharedImageUri(intent) ?: return
+    val shareKey = sharedImageUri.toString()
+    if (handledSharedImageKey == shareKey) {
+      return
+    }
+    handledSharedImageKey = shareKey
+
+    lifecycleScope.launch {
+      waitForModelAllowlist()
+
+      val task = modelManagerViewModel.getTaskById(BuiltInTaskId.LLM_ASK_IMAGE)
+      val model = resolveSharedImageModel()
+      if (task == null || model == null) {
+        ShareImageNotificationHelper.showError(
+          applicationContext,
+          SHARE_IMAGE_NOTIFICATION_ID,
+          getString(R.string.share_image_no_model_downloaded),
+        )
+        return@launch
+      }
+
+      val bitmap = decodeSharedImage(sharedImageUri)
+      if (bitmap == null) {
+        ShareImageNotificationHelper.showError(
+          applicationContext,
+          SHARE_IMAGE_NOTIFICATION_ID,
+          getString(R.string.share_image_decoding_failed),
+        )
+        return@launch
+      }
+
+      ShareImageNotificationHelper.showProcessing(
+        applicationContext,
+        SHARE_IMAGE_NOTIFICATION_ID,
+        model.displayName.ifEmpty { model.name },
+      )
+
+      val initialized = ensureAskImageModelInitialized(task = task, model = model)
+      if (!initialized) {
+        val initError =
+          modelManagerViewModel.uiState.value.modelInitializationStatus[model.name]?.error
+            ?.takeIf { it.isNotBlank() }
+            ?: getString(R.string.unknown_error)
+        ShareImageNotificationHelper.showError(
+          applicationContext,
+          SHARE_IMAGE_NOTIFICATION_ID,
+          initError,
+        )
+        return@launch
+      }
+
+      runSharedImageInference(model = model, bitmap = bitmap)
+    }
+  }
+
+  private fun extractSharedImageUri(intent: Intent?): Uri? {
+    if (intent?.action != Intent.ACTION_SEND) {
+      return null
+    }
+    if (intent.type?.startsWith("image/") != true) {
+      return null
+    }
+    @Suppress("DEPRECATION")
+    return intent.getParcelableExtra(Intent.EXTRA_STREAM)
+  }
+
+  private suspend fun waitForModelAllowlist() {
+    while (coroutineContext.isActive && modelManagerViewModel.uiState.value.loadingModelAllowlist) {
+      delay(100)
+    }
+  }
+
+  private fun resolveSharedImageModel(): Model? {
+    val selectedModel = modelManagerViewModel.getSelectedModel()
+    val downloadStatuses = modelManagerViewModel.uiState.value.modelDownloadStatus
+    if (
+      selectedModel != null &&
+        selectedModel.llmSupportImage &&
+        downloadStatuses[selectedModel.name]?.status == ModelDownloadStatusType.SUCCEEDED
+    ) {
+      return selectedModel
+    }
+
+    val askImageTask = modelManagerViewModel.getTaskById(BuiltInTaskId.LLM_ASK_IMAGE) ?: return null
+    return askImageTask.models.firstOrNull { model ->
+      model.llmSupportImage &&
+        downloadStatuses[model.name]?.status == ModelDownloadStatusType.SUCCEEDED
+    }
+  }
+
+  private fun decodeSharedImage(uri: Uri): Bitmap? {
+    return try {
+      val source = ImageDecoder.createSource(contentResolver, uri)
+      ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+        decoder.isMutableRequired = false
+        decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+      }
+    } catch (e: Exception) {
+      Log.e(TAG, "Failed to decode shared image", e)
+      null
+    }
+  }
+
+  private suspend fun ensureAskImageModelInitialized(
+    task: com.google.ai.edge.gallery.data.Task,
+    model: Model,
+  ): Boolean {
+    val currentStatus = modelManagerViewModel.uiState.value.modelInitializationStatus[model.name]
+    if (currentStatus?.status == ModelInitializationStatusType.INITIALIZED) {
+      return true
+    }
+
+    modelManagerViewModel.initializeModel(context = this, task = task, model = model)
+
+    val start = System.currentTimeMillis()
+    while (coroutineContext.isActive && System.currentTimeMillis() - start < SHARE_IMAGE_TIMEOUT_MS) {
+      when (modelManagerViewModel.uiState.value.modelInitializationStatus[model.name]?.status) {
+        ModelInitializationStatusType.INITIALIZED -> return true
+        ModelInitializationStatusType.ERROR -> return false
+        else -> delay(100)
+      }
+    }
+    return false
+  }
+
+  private fun runSharedImageInference(model: Model, bitmap: Bitmap) {
+    model.runtimeHelper.resetConversation(model = model, supportImage = true, supportAudio = false)
+    val responseBuilder = StringBuilder()
+    model.runtimeHelper.runInference(
+      model = model,
+      input = getString(R.string.share_image_prompt),
+      images = listOf(bitmap),
+      resultListener = { partialResult, done, _ ->
+        if (partialResult.isNotEmpty()) {
+          responseBuilder.append(partialResult)
+        }
+        if (!done) {
+          return@runInference
+        }
+        val finalText =
+          responseBuilder
+            .toString()
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .ifEmpty { getString(R.string.share_image_empty_result) }
+        ShareImageNotificationHelper.showResult(
+          applicationContext,
+          SHARE_IMAGE_NOTIFICATION_ID,
+          finalText,
+        )
+      },
+      cleanUpListener = {},
+      onError = { message ->
+        ShareImageNotificationHelper.showError(
+          applicationContext,
+          SHARE_IMAGE_NOTIFICATION_ID,
+          message.ifBlank { getString(R.string.unknown_error) },
+        )
+      },
+      coroutineScope = lifecycleScope,
+    )
   }
 }
