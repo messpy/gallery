@@ -1,11 +1,16 @@
 package com.google.ai.edge.gallery.customtasks.livecamera
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.graphics.Bitmap
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageProxy
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,9 +26,11 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -34,6 +41,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -47,7 +55,10 @@ import com.google.ai.edge.gallery.ui.modelmanager.ModelInitializationStatusType
 import com.google.ai.edge.gallery.ui.modelmanager.ModelManagerViewModel
 import kotlinx.coroutines.launch
 
-private const val ANALYZE_INTERVAL_MS = 2500L
+private const val ANALYZE_INTERVAL_MS = 0L
+private const val LIVE_FRAME_SIZE_PX = 192
+private const val LIVE_ANALYSIS_TIMEOUT_MS = 12000L
+private const val STILL_ANALYSIS_TIMEOUT_MS = 20000L
 
 private enum class LiveCameraMode(
   val label: String,
@@ -66,28 +77,171 @@ private enum class LiveCameraLanguage(
   KOREAN(label = "한국어", instructionName = "한국어"),
 }
 
+private enum class AnalysisSource {
+  LIVE,
+  STILL,
+}
+
 @Composable
 fun LiveCameraAiScreen(
   modelManagerViewModel: ModelManagerViewModel,
   bottomPadding: Dp,
   setAppBarControlsDisabled: (Boolean) -> Unit,
 ) {
+  val context = LocalContext.current
   val modelManagerUiState by modelManagerViewModel.uiState.collectAsState()
   val model = modelManagerUiState.selectedModel
   val scope = rememberCoroutineScope()
   var latestFrame by remember { mutableStateOf<Bitmap?>(null) }
+  var lockedFrame by remember { mutableStateOf<Bitmap?>(null) }
 
   var mode by remember { mutableStateOf(LiveCameraMode.DESCRIBE) }
   var outputLanguage by remember { mutableStateOf(LiveCameraLanguage.JAPANESE) }
   var analysisText by remember { mutableStateOf("カメラを起動しています…") }
-  var statusText by remember { mutableStateOf("ライブ解析を待機しています") }
+  var statusText by remember { mutableStateOf("カメラ映像を待っています") }
+  var liveAnalysisEnabled by remember { mutableStateOf(true) }
   var analysisInProgress by remember { mutableStateOf(false) }
   var lastAnalyzedAt by remember { mutableLongStateOf(0L) }
+  var currentRequestId by remember { mutableLongStateOf(0L) }
+  var debugLogText by remember { mutableStateOf("Live Camera AI log is empty.") }
 
   val initStatus = modelManagerUiState.modelInitializationStatus[model.name]?.status
   val modelReady = initStatus == ModelInitializationStatusType.INITIALIZED
 
-  LaunchedEffect(analysisInProgress) { setAppBarControlsDisabled(analysisInProgress) }
+  fun appendDebugLog(message: String) {
+    val entry = "${System.currentTimeMillis()} $message"
+    debugLogText =
+      (debugLogText.lineSequence().toList() + entry)
+        .filter { it.isNotBlank() }
+        .takeLast(60)
+        .joinToString(separator = "\n")
+  }
+
+  LaunchedEffect(Unit) { setAppBarControlsDisabled(false) }
+
+  LaunchedEffect(modelReady, liveAnalysisEnabled, latestFrame, analysisInProgress, lockedFrame) {
+    if (!modelReady) {
+      statusText = "画像対応モデルを初期化しています"
+    } else if (analysisInProgress) {
+      // Keep the in-progress label set by the active action.
+    } else if (!liveAnalysisEnabled) {
+      statusText = "LIVE解析はオフです"
+    } else if (lockedFrame != null) {
+      statusText = "同じ画像を解析できます"
+    } else if (
+      latestFrame != null &&
+        statusText in
+          setOf(
+            "カメラ映像を待っています",
+            "画像対応モデルを初期化しています",
+            "次のカメラ映像を待っています",
+            "カメラ映像を解析から再開する",
+          )
+    ) {
+      statusText = "カメラ映像を解析できます"
+    } else {
+      statusText = "カメラ映像を待っています"
+    }
+  }
+
+  LaunchedEffect(mode, outputLanguage, modelReady) {
+    val frame = lockedFrame ?: return@LaunchedEffect
+    if (!modelReady || analysisInProgress) {
+      return@LaunchedEffect
+    }
+    val requestId = currentRequestId + 1L
+    currentRequestId = requestId
+    analysisInProgress = true
+    statusText = "画像を解析しています"
+    appendDebugLog("still:start requestId=$requestId mode=${mode.name} language=${outputLanguage.name} size=${frame.width}x${frame.height}")
+    runAnalysis(
+      model = model,
+      bitmap = frame.copy(frame.config ?: Bitmap.Config.ARGB_8888, false),
+      mode = mode,
+      outputLanguage = outputLanguage,
+      source = AnalysisSource.STILL,
+      requestId = requestId,
+      onResult = { result ->
+        if (requestId != currentRequestId) {
+          return@runAnalysis
+        }
+        appendDebugLog("still:success requestId=$requestId resultLength=${result.length}")
+        analysisText = result
+        statusText = "静止画解析が完了しました"
+        analysisInProgress = false
+      },
+      onError = { error ->
+        if (requestId != currentRequestId) {
+          return@runAnalysis
+        }
+        appendDebugLog("still:error requestId=$requestId reason=$error")
+        analysisText = error
+        statusText = "静止画解析に失敗しました"
+        analysisInProgress = false
+      },
+    )
+  }
+
+  LaunchedEffect(modelReady, liveAnalysisEnabled, latestFrame, analysisInProgress, lockedFrame, mode, outputLanguage) {
+    val frame = latestFrame ?: return@LaunchedEffect
+    if (!modelReady || !liveAnalysisEnabled || analysisInProgress || lockedFrame != null) {
+      return@LaunchedEffect
+    }
+
+    val now = System.currentTimeMillis()
+    if (now - lastAnalyzedAt < ANALYZE_INTERVAL_MS) {
+      return@LaunchedEffect
+    }
+
+    lastAnalyzedAt = now
+    val requestId = currentRequestId + 1L
+    currentRequestId = requestId
+    analysisInProgress = true
+    statusText = "カメラ映像を解析しています"
+    appendDebugLog("live:start requestId=$requestId mode=${mode.name} language=${outputLanguage.name} size=${frame.width}x${frame.height}")
+    val frameForAnalysis =
+      frame
+        .copy(frame.config ?: Bitmap.Config.ARGB_8888, false)
+        .let { Bitmap.createScaledBitmap(it, LIVE_FRAME_SIZE_PX, LIVE_FRAME_SIZE_PX, true) }
+
+    scope.launch {
+      launch {
+        kotlinx.coroutines.delay(LIVE_ANALYSIS_TIMEOUT_MS)
+        if (requestId == currentRequestId && analysisInProgress) {
+          model.runtimeHelper.stopResponse(model)
+          analysisInProgress = false
+          appendDebugLog("live:timeout requestId=$requestId")
+          statusText = "カメラ映像を解析から再開する"
+        }
+      }
+      runAnalysis(
+        model = model,
+        bitmap = frameForAnalysis,
+        mode = mode,
+        outputLanguage = outputLanguage,
+        source = AnalysisSource.LIVE,
+        requestId = requestId,
+        onResult = { result ->
+          if (requestId != currentRequestId) {
+            return@runAnalysis
+          }
+          appendDebugLog("live:success requestId=$requestId resultLength=${result.length}")
+          analysisText = result
+          statusText = "カメラ映像の解析が完了しました"
+          analysisInProgress = false
+        },
+        onError = { error ->
+          if (requestId != currentRequestId) {
+            return@runAnalysis
+          }
+          appendDebugLog("live:error requestId=$requestId reason=$error")
+          analysisText = error
+          statusText = "次のカメラ映像を待っています"
+          analysisInProgress = false
+        },
+      )
+    }
+  }
 
   Column(
     modifier =
@@ -106,40 +260,7 @@ fun LiveCameraAiScreen(
           cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA,
           onBitmap = { bitmap: Bitmap, imageProxy: ImageProxy ->
             latestFrame = bitmap
-            if (!modelReady) {
-              imageProxy.close()
-              return@LiveCameraView
-            }
-
-            val now = System.currentTimeMillis()
-            if (analysisInProgress || now - lastAnalyzedAt < ANALYZE_INTERVAL_MS) {
-              imageProxy.close()
-              return@LiveCameraView
-            }
-
-            lastAnalyzedAt = now
-            analysisInProgress = true
-            statusText = "AI解析中"
-            val frameForAnalysis = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
             imageProxy.close()
-            scope.launch {
-              runAnalysis(
-                model = model,
-                bitmap = frameForAnalysis,
-                mode = mode,
-                outputLanguage = outputLanguage,
-                onResult = { result ->
-                  analysisText = result
-                  statusText = "ライブ解析を継続中"
-                  analysisInProgress = false
-                },
-                onError = { error ->
-                  analysisText = error
-                  statusText = "再試行待ち"
-                  analysisInProgress = false
-                },
-              )
-            }
           },
         )
 
@@ -157,27 +278,48 @@ fun LiveCameraAiScreen(
                   CircleShape,
                 )
                 .border(width = 2.dp, color = Color.White, shape = CircleShape)
-                .clickable(enabled = modelReady && latestFrame != null && !analysisInProgress) {
+                .clickable(enabled = modelReady && latestFrame != null) {
                   val captureBitmap = latestFrame ?: return@clickable
+                  val requestId = currentRequestId + 1L
+                  currentRequestId = requestId
                   analysisInProgress = true
-                  statusText = "静止画を高精度解析中"
+                  statusText = "静止画を解析しています"
+                  appendDebugLog("still:capture requestId=$requestId hasLatestFrame=${captureBitmap.width}x${captureBitmap.height}")
                   val stillFrame =
                     captureBitmap.copy(captureBitmap.config ?: Bitmap.Config.ARGB_8888, false)
                   scope.launch {
+                    launch {
+                      kotlinx.coroutines.delay(STILL_ANALYSIS_TIMEOUT_MS)
+                      if (requestId == currentRequestId && analysisInProgress) {
+                        model.runtimeHelper.stopResponse(model)
+                        analysisInProgress = false
+                        appendDebugLog("still:timeout requestId=$requestId")
+                        statusText = "静止画解析を再試行できます"
+                      }
+                    }
                     runAnalysis(
                       model = model,
                       bitmap = stillFrame,
                       mode = mode,
                       outputLanguage = outputLanguage,
+                      source = AnalysisSource.STILL,
+                      requestId = requestId,
                       onResult = { result ->
+                        if (requestId != currentRequestId) {
+                          return@runAnalysis
+                        }
+                        lockedFrame = stillFrame
                         analysisText = result
-                        statusText = "静止画解析が完了しました"
+                        statusText = "静止画の解析が完了しました"
                         analysisInProgress = false
                         lastAnalyzedAt = System.currentTimeMillis()
                       },
                       onError = { error ->
+                        if (requestId != currentRequestId) {
+                          return@runAnalysis
+                        }
                         analysisText = error
-                        statusText = "静止画解析に失敗しました"
+                        statusText = "静止画の解析に失敗しました"
                         analysisInProgress = false
                       },
                     )
@@ -252,8 +394,10 @@ fun LiveCameraAiScreen(
             shape = RoundedCornerShape(999.dp),
             onClick = {
               mode = entry
-              statusText = "ライブ解析を待機しています"
-              lastAnalyzedAt = 0L
+              statusText = if (lockedFrame != null) "同じ画像を解析します" else "カメラ映像を解析できます"
+              if (lockedFrame == null) {
+                lastAnalyzedAt = 0L
+              }
             },
           ) {
             Text(
@@ -291,8 +435,10 @@ fun LiveCameraAiScreen(
             shape = RoundedCornerShape(999.dp),
             onClick = {
               outputLanguage = entry
-              statusText = "ライブ解析を待機しています"
-              lastAnalyzedAt = 0L
+              statusText = if (lockedFrame != null) "同じ画像を解析します" else "カメラ映像を解析できます"
+              if (lockedFrame == null) {
+                lastAnalyzedAt = 0L
+              }
             },
           ) {
             Text(
@@ -305,6 +451,44 @@ fun LiveCameraAiScreen(
             )
           }
         }
+      }
+
+      Spacer(modifier = Modifier.height(14.dp))
+
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+      ) {
+        Column {
+          Text(
+            text = "LIVE解析",
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+            fontWeight = FontWeight.SemiBold,
+          )
+          Spacer(modifier = Modifier.height(2.dp))
+          Text(
+            text = if (liveAnalysisEnabled) "オン" else "オフ",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+          )
+        }
+        Switch(
+          checked = liveAnalysisEnabled,
+          onCheckedChange = { enabled ->
+            liveAnalysisEnabled = enabled
+            statusText =
+              when {
+                enabled && lockedFrame != null -> "同じ画像を解析します"
+                enabled -> "カメラ映像を解析できます"
+                else -> "LIVE解析はオフです"
+              }
+            if (enabled) {
+              lastAnalyzedAt = 0L
+            }
+          },
+        )
       }
 
       Spacer(modifier = Modifier.height(14.dp))
@@ -323,10 +507,52 @@ fun LiveCameraAiScreen(
       ) {
         Text(
           text = analysisText,
-          modifier = Modifier.fillMaxWidth().padding(16.dp),
+          modifier =
+            Modifier.fillMaxWidth()
+              .height(140.dp)
+              .verticalScroll(rememberScrollState())
+              .padding(16.dp),
           style = MaterialTheme.typography.bodyLarge,
           color = MaterialTheme.colorScheme.onSurface,
         )
+      }
+
+      Spacer(modifier = Modifier.height(10.dp))
+
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.End,
+      ) {
+        Surface(
+          shape = RoundedCornerShape(999.dp),
+          color = MaterialTheme.colorScheme.secondaryContainer,
+          onClick = {
+            val clipboard =
+              context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val payload =
+              buildString {
+                append("status=")
+                append(statusText)
+                append('\n')
+                append("analysis=")
+                append(analysisText)
+                append('\n')
+                append("model=")
+                append(model.displayName.ifEmpty { model.name })
+                append('\n')
+                append(debugLogText)
+              }
+            clipboard.setPrimaryClip(ClipData.newPlainText("live-camera-ai-log", payload))
+            statusText = "詳細ログをコピーしました"
+          },
+        ) {
+          Text(
+            text = "詳細ログをコピー",
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSecondaryContainer,
+          )
+        }
       }
     }
   }
@@ -337,6 +563,8 @@ private fun runAnalysis(
   bitmap: Bitmap,
   mode: LiveCameraMode,
   outputLanguage: LiveCameraLanguage,
+  source: AnalysisSource,
+  requestId: Long,
   onResult: (String) -> Unit,
   onError: (String) -> Unit,
 ) {
@@ -344,20 +572,19 @@ private fun runAnalysis(
   model.runtimeHelper.resetConversation(model = model, supportImage = true, supportAudio = false)
   model.runtimeHelper.runInference(
     model = model,
-    input = buildPrompt(mode = mode, outputLanguage = outputLanguage),
+    input = buildPrompt(mode = mode, outputLanguage = outputLanguage, source = source),
     images = listOf(bitmap),
     resultListener = { partialResult, done, _ ->
       if (partialResult.isNotEmpty()) {
         response.append(partialResult)
       }
       if (done) {
-        val text =
-          response
-            .toString()
-            .replace(Regex("\\s+"), " ")
-            .trim()
-            .ifEmpty { "結果を取得できませんでした。" }
-        onResult(text)
+        val text = response.toString().replace(Regex("\\s+"), " ").trim()
+        if (text.isEmpty()) {
+          onError("画像から十分な情報を読み取れませんでした。次の解析を試します。")
+        } else {
+          onResult(text)
+        }
       }
     },
     cleanUpListener = {},
@@ -367,11 +594,23 @@ private fun runAnalysis(
   )
 }
 
-private fun buildPrompt(mode: LiveCameraMode, outputLanguage: LiveCameraLanguage): String {
+private fun buildPrompt(
+  mode: LiveCameraMode,
+  outputLanguage: LiveCameraLanguage,
+  source: AnalysisSource,
+): String {
   return when (mode) {
     LiveCameraMode.DESCRIBE ->
-      "このカメラ映像の内容を${outputLanguage.instructionName}で短く説明してください。人物、物体、場所、状況を分かる範囲で具体的に述べてください。"
+      if (source == AnalysisSource.LIVE) {
+        "このカメラ映像の主要な内容だけを${outputLanguage.instructionName}でごく短く説明してください。1文だけで、いちばん目立つ人物、物体、場所の要点だけを答えてください。"
+      } else {
+        "このカメラ映像の内容を${outputLanguage.instructionName}で短めに説明してください。長すぎる列挙は避けつつ、人物、物体、場所、状況など主要な情報は分かる範囲で自然に含めてください。"
+      }
     LiveCameraMode.TRANSLATE ->
-      "このカメラ映像では文字だけを対象にしてください。見える文字列をできるだけ正確に抽出し、その内容だけを${outputLanguage.instructionName}で自然に翻訳してください。画像全体の説明や物体説明は不要です。文字が見当たらない場合は、文字は見当たらないと${outputLanguage.instructionName}で短く答えてください。"
+      if (source == AnalysisSource.LIVE) {
+        "このカメラ映像では大きく見える文字だけを対象にしてください。見える主要な文字列だけを短く抽出し、その内容だけを${outputLanguage.instructionName}で翻訳してください。文字が分からない場合は、文字なしと${outputLanguage.instructionName}で短く答えてください。"
+      } else {
+        "このカメラ映像では文字だけを対象にしてください。見える文字列をできるだけ正確に抽出し、その内容だけを${outputLanguage.instructionName}で自然に翻訳してください。画像全体の説明や物体説明は不要です。文字が見当たらない場合は、文字は見当たらないと${outputLanguage.instructionName}で短く答えてください。"
+      }
   }
 }
