@@ -71,7 +71,7 @@ import kotlinx.coroutines.launch
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
 
-  private var handledSharedImageKey: String? = null
+  private var handledSharedShareKey: String? = null
   private val modelManagerViewModel: ModelManagerViewModel by viewModels()
   private var splashScreenAboutToExit: Boolean = false
   private var contentSet: Boolean = false
@@ -195,63 +195,206 @@ class MainActivity : ComponentActivity() {
   companion object {
     private const val TAG = "AGMainActivity"
     private const val SHARE_IMAGE_NOTIFICATION_ID = 41231
+    private const val SHARE_TEXT_NOTIFICATION_ID = 41232
     private const val SHARE_IMAGE_TIMEOUT_MS = 120_000L
   }
 
   private fun handleSharedImageIntent(intent: Intent?) {
-    val sharedImageUri = extractSharedImageUri(intent) ?: return
-    val shareKey = sharedImageUri.toString()
-    if (handledSharedImageKey == shareKey) {
+    val sharedImageUri = extractSharedImageUri(intent)
+    val sharedText = extractSharedText(intent)
+    val shareKey = sharedImageUri?.toString() ?: sharedText ?: return
+    if (handledSharedShareKey == shareKey) {
       return
     }
-    handledSharedImageKey = shareKey
+    handledSharedShareKey = shareKey
 
     lifecycleScope.launch {
       waitForModelAllowlist()
 
-      val task = modelManagerViewModel.getTaskById(BuiltInTaskId.LLM_ASK_IMAGE)
-      val model = resolveSharedImageModel()
-      if (task == null || model == null) {
-        ShareImageNotificationHelper.showError(
-          applicationContext,
-          SHARE_IMAGE_NOTIFICATION_ID,
-          getString(R.string.share_image_no_model_downloaded),
-        )
-        return@launch
+      if (sharedImageUri != null) {
+        handleSharedImage(sharedImageUri)
+      } else if (sharedText != null) {
+        handleSharedText(sharedText)
       }
+    }
+  }
 
-      val bitmap = decodeSharedImage(sharedImageUri)
-      if (bitmap == null) {
-        ShareImageNotificationHelper.showError(
-          applicationContext,
-          SHARE_IMAGE_NOTIFICATION_ID,
-          getString(R.string.share_image_decoding_failed),
-        )
-        return@launch
-      }
-
-      ShareImageNotificationHelper.showProcessing(
+  private suspend fun handleSharedImage(sharedImageUri: Uri) {
+    val task = modelManagerViewModel.getTaskById(BuiltInTaskId.LLM_ASK_IMAGE)
+    val model = resolveSharedImageModel()
+    if (task == null || model == null) {
+      ShareImageNotificationHelper.showError(
         applicationContext,
         SHARE_IMAGE_NOTIFICATION_ID,
-        model.displayName.ifEmpty { model.name },
+        getString(R.string.share_image_no_model_downloaded),
       )
+      return
+    }
 
-      val initialized = ensureAskImageModelInitialized(task = task, model = model)
-      if (!initialized) {
-        val initError =
-          modelManagerViewModel.uiState.value.modelInitializationStatus[model.name]?.error
-            ?.takeIf { it.isNotBlank() }
-            ?: getString(R.string.unknown_error)
+    val bitmap = decodeSharedImage(sharedImageUri)
+    if (bitmap == null) {
+      ShareImageNotificationHelper.showError(
+        applicationContext,
+        SHARE_IMAGE_NOTIFICATION_ID,
+        getString(R.string.share_image_decoding_failed),
+      )
+      return
+    }
+
+    ShareImageNotificationHelper.showProcessing(
+      applicationContext,
+      SHARE_IMAGE_NOTIFICATION_ID,
+      getString(R.string.share_image_notification_processing_title),
+      getString(R.string.share_image_notification_processing_content).format(
+        model.displayName.ifEmpty { model.name }
+      ),
+    )
+
+    val initialized = ensureModelInitialized(task = task, model = model)
+    if (!initialized) {
+      val initError =
+        modelManagerViewModel.uiState.value.modelInitializationStatus[model.name]?.error
+          ?.takeIf { it.isNotBlank() }
+          ?: getString(R.string.unknown_error)
+      ShareImageNotificationHelper.showError(
+        applicationContext,
+        SHARE_IMAGE_NOTIFICATION_ID,
+        initError,
+        getString(R.string.share_image_notification_error_title),
+      )
+      return
+    }
+
+    runSharedImageInference(model = model, bitmap = bitmap)
+  }
+
+  private suspend fun handleSharedText(sharedText: String) {
+    val task = modelManagerViewModel.getTaskById(BuiltInTaskId.LLM_CHAT)
+    val model = resolveSharedTextModel()
+    if (task == null || model == null) {
+      ShareImageNotificationHelper.showError(
+        applicationContext,
+        SHARE_TEXT_NOTIFICATION_ID,
+        getString(R.string.share_text_no_model_downloaded),
+        getString(R.string.share_text_notification_error_title),
+      )
+      return
+    }
+
+    ShareImageNotificationHelper.showProcessing(
+      applicationContext,
+      SHARE_TEXT_NOTIFICATION_ID,
+      getString(R.string.share_text_notification_processing_title),
+      getString(R.string.share_text_notification_processing_content).format(
+        model.displayName.ifEmpty { model.name }
+      ),
+    )
+
+    val initialized = ensureModelInitialized(task = task, model = model)
+    if (!initialized) {
+      val initError =
+        modelManagerViewModel.uiState.value.modelInitializationStatus[model.name]?.error
+          ?.takeIf { it.isNotBlank() }
+          ?: getString(R.string.unknown_error)
+      ShareImageNotificationHelper.showError(
+        applicationContext,
+        SHARE_TEXT_NOTIFICATION_ID,
+        initError,
+        getString(R.string.share_text_notification_error_title),
+      )
+      return
+    }
+
+    runSharedTextInference(model = model, sharedText = sharedText)
+  }
+
+  private fun extractSharedText(intent: Intent?): String? {
+    if (intent?.action != Intent.ACTION_SEND) {
+      return null
+    }
+    if (intent.type != "text/plain") {
+      return null
+    }
+    return intent.getStringExtra(Intent.EXTRA_TEXT)?.trim()?.takeIf { it.isNotEmpty() }
+  }
+
+  private fun resolveSharedTextModel(): Model? {
+    val selectedModel = modelManagerViewModel.getSelectedModel()
+    val downloadStatuses = modelManagerViewModel.uiState.value.modelDownloadStatus
+    if (
+      selectedModel != null &&
+        selectedModel.isLlm &&
+        downloadStatuses[selectedModel.name]?.status == ModelDownloadStatusType.SUCCEEDED
+    ) {
+      return selectedModel
+    }
+
+    val chatTask = modelManagerViewModel.getTaskById(BuiltInTaskId.LLM_CHAT) ?: return null
+    return chatTask.models.firstOrNull { model ->
+      model.isLlm &&
+        downloadStatuses[model.name]?.status == ModelDownloadStatusType.SUCCEEDED
+    }
+  }
+
+  private suspend fun ensureModelInitialized(
+    task: com.google.ai.edge.gallery.data.Task,
+    model: Model,
+  ): Boolean {
+    val currentStatus = modelManagerViewModel.uiState.value.modelInitializationStatus[model.name]
+    if (currentStatus?.status == ModelInitializationStatusType.INITIALIZED) {
+      return true
+    }
+
+    modelManagerViewModel.initializeModel(context = this, task = task, model = model)
+
+    val start = System.currentTimeMillis()
+    while (coroutineContext.isActive && System.currentTimeMillis() - start < SHARE_IMAGE_TIMEOUT_MS) {
+      when (modelManagerViewModel.uiState.value.modelInitializationStatus[model.name]?.status) {
+        ModelInitializationStatusType.INITIALIZED -> return true
+        ModelInitializationStatusType.ERROR -> return false
+        else -> delay(100)
+      }
+    }
+    return false
+  }
+
+  private fun runSharedTextInference(model: Model, sharedText: String) {
+    model.runtimeHelper.resetConversation(model = model, supportImage = false, supportAudio = false)
+    val responseBuilder = StringBuilder()
+    model.runtimeHelper.runInference(
+      model = model,
+      input = getString(R.string.share_text_prompt_prefix) + sharedText,
+      resultListener = { partialResult, done, _ ->
+        if (partialResult.isNotEmpty()) {
+          responseBuilder.append(partialResult)
+        }
+        if (!done) {
+          return@runInference
+        }
+        val finalText =
+          responseBuilder
+            .toString()
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .ifEmpty { getString(R.string.share_text_empty_result) }
+        ShareImageNotificationHelper.showResult(
+          applicationContext,
+          SHARE_TEXT_NOTIFICATION_ID,
+          finalText,
+          getString(R.string.share_text_notification_result_title),
+        )
+      },
+      cleanUpListener = {},
+      onError = { message ->
         ShareImageNotificationHelper.showError(
           applicationContext,
-          SHARE_IMAGE_NOTIFICATION_ID,
-          initError,
+          SHARE_TEXT_NOTIFICATION_ID,
+          message.ifBlank { getString(R.string.unknown_error) },
+          getString(R.string.share_text_notification_error_title),
         )
-        return@launch
-      }
-
-      runSharedImageInference(model = model, bitmap = bitmap)
-    }
+      },
+      coroutineScope = lifecycleScope,
+    )
   }
 
   private fun extractSharedImageUri(intent: Intent?): Uri? {
@@ -302,28 +445,6 @@ class MainActivity : ComponentActivity() {
     }
   }
 
-  private suspend fun ensureAskImageModelInitialized(
-    task: com.google.ai.edge.gallery.data.Task,
-    model: Model,
-  ): Boolean {
-    val currentStatus = modelManagerViewModel.uiState.value.modelInitializationStatus[model.name]
-    if (currentStatus?.status == ModelInitializationStatusType.INITIALIZED) {
-      return true
-    }
-
-    modelManagerViewModel.initializeModel(context = this, task = task, model = model)
-
-    val start = System.currentTimeMillis()
-    while (coroutineContext.isActive && System.currentTimeMillis() - start < SHARE_IMAGE_TIMEOUT_MS) {
-      when (modelManagerViewModel.uiState.value.modelInitializationStatus[model.name]?.status) {
-        ModelInitializationStatusType.INITIALIZED -> return true
-        ModelInitializationStatusType.ERROR -> return false
-        else -> delay(100)
-      }
-    }
-    return false
-  }
-
   private fun runSharedImageInference(model: Model, bitmap: Bitmap) {
     model.runtimeHelper.resetConversation(model = model, supportImage = true, supportAudio = false)
     val responseBuilder = StringBuilder()
@@ -348,6 +469,7 @@ class MainActivity : ComponentActivity() {
           applicationContext,
           SHARE_IMAGE_NOTIFICATION_ID,
           finalText,
+          getString(R.string.share_image_notification_result_title),
         )
       },
       cleanUpListener = {},
@@ -356,6 +478,7 @@ class MainActivity : ComponentActivity() {
           applicationContext,
           SHARE_IMAGE_NOTIFICATION_ID,
           message.ifBlank { getString(R.string.unknown_error) },
+          getString(R.string.share_image_notification_error_title),
         )
       },
       coroutineScope = lifecycleScope,

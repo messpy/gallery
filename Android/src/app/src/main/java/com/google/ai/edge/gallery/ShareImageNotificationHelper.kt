@@ -15,31 +15,35 @@ internal object ShareImageNotificationHelper {
   private const val CHANNEL_ID = "shared_image_analysis"
   private const val CHANNEL_NAME = "Shared image analysis"
 
-  fun showProcessing(context: Context, notificationId: Int, modelName: String) {
+  fun showProcessing(context: Context, notificationId: Int, title: String, text: String) {
     notify(
       context = context,
       notificationId = notificationId,
-      title = context.getString(R.string.share_image_notification_processing_title),
-      text =
-        context.getString(R.string.share_image_notification_processing_content).format(modelName),
+      title = title,
+      text = text,
       ongoing = true,
     )
   }
 
-  fun showResult(context: Context, notificationId: Int, text: String) {
+  fun showResult(context: Context, notificationId: Int, text: String, title: String) {
     notify(
       context = context,
       notificationId = notificationId,
-      title = context.getString(R.string.share_image_notification_result_title),
+      title = title,
       text = text,
     )
   }
 
-  fun showError(context: Context, notificationId: Int, text: String) {
+  fun showError(
+    context: Context,
+    notificationId: Int,
+    text: String,
+    title: String = context.getString(R.string.share_image_notification_error_title),
+  ) {
     notify(
       context = context,
       notificationId = notificationId,
-      title = context.getString(R.string.share_image_notification_error_title),
+      title = title,
       text = text,
     )
   }

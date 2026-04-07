@@ -168,7 +168,14 @@
   <string name="share_image_no_model_downloaded" translatable="false">No downloaded Ask Image model is available. Download an image-capable model first.</string>
   <string name="share_image_decoding_failed" translatable="false">Failed to open the shared image.</string>
   <string name="share_image_empty_result" translatable="false">The model did not return a description for the shared image.</string>
-  <string name="share_image_prompt" translatable="false">この画像が何かを日本語で短く説明してください。わからない場合は見える内容だけを述べてください。</string>
+  <string name="share_image_prompt" translatable="false">この画像を解析してください。画像内に文字がある場合は、見える文字列をできるだけ正確にそのまま書き起こしてください。その後で、この画像が何かを日本語で短く説明してください。文字が読めない場合は推測で補わず、判読不能と書いてください。</string>
+  <string name="share_text_notification_processing_title" translatable="false">Analyzing shared text</string>
+  <string name="share_text_notification_processing_content" translatable="false">Running text analysis with %s</string>
+  <string name="share_text_notification_result_title" translatable="false">Shared text result</string>
+  <string name="share_text_notification_error_title" translatable="false">Shared text analysis failed</string>
+  <string name="share_text_no_model_downloaded" translatable="false">No downloaded text model is available. Download a chat model first.</string>
+  <string name="share_text_empty_result" translatable="false">The model did not return a response for the shared text.</string>
+  <string name="share_text_prompt_prefix" translatable="false">次の共有テキストの内容を日本語で短く要約し、必要なら主題も一言で添えてください。\n\n共有テキスト:\n</string>
   <string name="share" translatable="false">Share</string>
   <string name="slide_up_to_cancel" translatable="false">Slide up to cancel</string>
   <string name="system_prompt_updated" translatable="false">System prompt updated</string>
