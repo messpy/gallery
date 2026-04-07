@@ -99,6 +99,8 @@ fun LlmAskImageScreen(
   navigateUp: () -> Unit,
   modifier: Modifier = Modifier,
   viewModel: LlmAskImageViewModel = hiltViewModel(),
+  sendMessageTrigger: SendMessageTrigger? = null,
+  onGenerateResponseDone: (Model) -> Unit = {},
 ) {
   ChatViewWrapper(
     viewModel = viewModel,
@@ -108,6 +110,8 @@ fun LlmAskImageScreen(
     modifier = modifier,
     showImagePicker = true,
     showAudioPicker = false,
+    sendMessageTrigger = sendMessageTrigger,
+    onGenerateResponseDone = onGenerateResponseDone,
     emptyStateComposable = { model ->
       Box(modifier = Modifier.fillMaxSize()) {
         Column(

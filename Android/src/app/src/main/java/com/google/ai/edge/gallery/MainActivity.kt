@@ -17,8 +17,13 @@
 package com.google.ai.edge.gallery
 
 import android.animation.ObjectAnimator
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.View
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
@@ -60,11 +65,15 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
 
   private val modelManagerViewModel: ModelManagerViewModel by viewModels()
+  private val shareIntentViewModel: ShareIntentViewModel by viewModels()
   private var splashScreenAboutToExit: Boolean = false
   private var contentSet: Boolean = false
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+
+    // Handle share intent that launched the activity.
+    handleShareIntent(intent)
 
     fun setContent() {
       if (contentSet) {
@@ -169,6 +178,59 @@ class MainActivity : ComponentActivity() {
         "device_model" to Build.MODEL,
       ),
     )
+  }
+
+  override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    handleShareIntent(intent)
+  }
+
+  /**
+   * Extracts text and/or images from an ACTION_SEND or ACTION_SEND_MULTIPLE intent and stores
+   * them in [ShareIntentViewModel] so the chat screens can consume them.
+   */
+  private fun handleShareIntent(intent: Intent) {
+    val action = intent.action ?: return
+    if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
+
+    val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT) ?: ""
+    val images = mutableListOf<Bitmap>()
+
+    if (action == Intent.ACTION_SEND) {
+      val uri: Uri? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+          intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+          @Suppress("DEPRECATION")
+          intent.getParcelableExtra(Intent.EXTRA_STREAM)
+        }
+      uri?.let { decodeBitmap(it)?.let { bmp -> images.add(bmp) } }
+    } else if (action == Intent.ACTION_SEND_MULTIPLE) {
+      val uris: List<Uri>? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+          intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+          @Suppress("DEPRECATION")
+          intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+        }
+      uris?.forEach { uri -> decodeBitmap(uri)?.let { bmp -> images.add(bmp) } }
+    }
+
+    if (sharedText.isNotEmpty() || images.isNotEmpty()) {
+      Log.d(TAG, "Share intent received: text='$sharedText', images=${images.size}")
+      shareIntentViewModel.setSharedContent(text = sharedText, images = images)
+    }
+  }
+
+  private fun decodeBitmap(uri: Uri): Bitmap? {
+    return try {
+      contentResolver.openInputStream(uri)?.use { stream ->
+        BitmapFactory.decodeStream(stream)
+      }
+    } catch (e: Exception) {
+      Log.w(TAG, "Failed to decode bitmap from URI: $uri", e)
+      null
+    }
   }
 
   companion object {

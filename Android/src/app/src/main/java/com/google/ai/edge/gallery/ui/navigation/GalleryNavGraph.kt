@@ -70,8 +70,10 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.navArgument
 import com.google.ai.edge.gallery.GalleryEvent
+import com.google.ai.edge.gallery.ShareIntentViewModel
 import com.google.ai.edge.gallery.customtasks.common.CustomTaskData
 import com.google.ai.edge.gallery.customtasks.common.CustomTaskDataForBuiltinTask
+import com.google.ai.edge.gallery.data.BuiltInTaskId
 import com.google.ai.edge.gallery.data.ModelDownloadStatusType
 import com.google.ai.edge.gallery.data.Task
 import com.google.ai.edge.gallery.data.isLegacyTasks
@@ -156,6 +158,22 @@ fun GalleryNavHost(
   var enableHomeScreenAnimation by remember { mutableStateOf(true) }
   var enableModelListAnimation by remember { mutableStateOf(true) }
   var lastNavigatedModelName = remember { "" }
+
+  // Observe share intent content and auto-navigate to the appropriate task.
+  val shareIntentViewModel: ShareIntentViewModel = hiltViewModel()
+  val sharedContent by shareIntentViewModel.sharedContent.collectAsState()
+  LaunchedEffect(sharedContent) {
+    val content = sharedContent ?: return@LaunchedEffect
+    // Choose task based on whether images are present.
+    val targetTaskId =
+      if (content.images.isNotEmpty()) BuiltInTaskId.LLM_ASK_IMAGE else BuiltInTaskId.LLM_CHAT
+    val targetTask = modelManagerViewModel.getTaskById(id = targetTaskId) ?: return@LaunchedEffect
+    // Always update the picked task so the model list shows the correct task.
+    pickedTask = targetTask
+    enableModelListAnimation = true
+    // Navigate to model list, clearing back stack to the home screen first if needed.
+    navController.navigate(ROUTE_MODEL_LIST) { popUpTo(ROUTE_HOMESCREEN) }
+  }
 
   // Track whether app is in foreground.
   DisposableEffect(lifecycleOwner) {
